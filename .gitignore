@@ -1,4 +1,4 @@
 .vocaby
 anki_*
 *.db
-vocabyold.py
+config.json
