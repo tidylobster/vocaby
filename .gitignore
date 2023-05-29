@@ -1,4 +1,4 @@
 .vocaby
-anki_*
+*.txt
 *.db
 config.json
