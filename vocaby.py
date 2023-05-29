@@ -1,19 +1,13 @@
 
-import click 
-import sqlite3
-from nltk.stem import PorterStemmer
-import os
-import json
-import itertools
-import datetime
-import textwrap
-from typing import List
-from sqlite3 import Connection
-from dataclasses import dataclass
-from tabulate import tabulate
+import click, sqlite3, openai, openai.error
+import os, time, json, itertools, datetime, textwrap
 from glob import glob
-import openai
+from typing import List
 from contextlib import contextmanager
+from dataclasses import dataclass
+from sqlite3 import Connection
+from nltk.stem import PorterStemmer
+from tabulate import tabulate
 
 
 with open("config.json", "r") as file:
@@ -66,7 +60,6 @@ class Processed:
 class History:
     def __init__(self, words: dict):
         self.words = words
-        self.updated_words = words.copy()
         self.ps = PorterStemmer()
 
     def __contains__(self, word: Translation):
@@ -80,7 +73,7 @@ class History:
             raise KeyError(stem)
 
     def add(self, word: Translation):
-        self.updated_words.setdefault(self.ps.stem(word.word), []).append(word.usage)
+        self.words.setdefault(self.ps.stem(word.word), []).append(f"{word.translation} :: {word.usage}")
 
     @classmethod
     def load(cls):
@@ -92,9 +85,7 @@ class History:
     def save(self):
         os.makedirs(BASE_PATH, exist_ok=True)
         with open(os.path.join(BASE_PATH, "history.json"), "w") as file:
-            json.dump(dict(sorted(self.updated_words.items(), key=lambda x: x[0])), file, indent=2)
-            self.words = self.updated_words
-            self.updated_words = self.words.copy()
+            json.dump(dict(sorted(self.words.items(), key=lambda x: x[0])), file, indent=2)
 
             
 @contextmanager
@@ -177,6 +168,8 @@ def process_words(words: List[Lookup], history: History) -> Processed:
                 case "y": 
                     confirmed.append(tr)
                     history.add(tr)
+                case "h":
+                    history.add(tr)
                 case "n":
                     rejected.append(tr)
                 case "r":
@@ -197,13 +190,21 @@ def prompt_user(i: int, limit: int, tr: Translation, history: History):
     if tr in history:
         click.echo("#"*80)
         click.echo("Similar word was already processed!\n\n".upper())
-        click.echo("\n---\n".join(map(lambda x: textwrap.fill(x, width=80), history[tr.word])))
+        numbered = map(lambda i: f'{i[0]+1}. {i[1]}', enumerate(history[tr]))
+        wrapped = map(lambda x: textwrap.fill(x, width=80), numbered)
+        click.echo("\n---\n".join(wrapped))
         click.echo("#"*80 + "\n")
     click.echo(textwrap.fill(tr.usage, width=80))
     click.echo("")
     click.echo(f"{tr.book}")
     click.echo("---\n")
-    return click.prompt(text="Save this translation?", default="y", type=click.Choice(["y", "n", "r"], case_sensitive=False))
+    text = "Save this translation?\n(y)es, (n)o, (r)etry, (h)istory"
+    return click.prompt(
+        text=text, 
+        default="y", 
+        type=click.Choice(["y", "n", "r", "h"], case_sensitive=False), 
+        show_choices=False
+    )
     
 
 def print_stats(timestamp, conn):
@@ -277,10 +278,20 @@ def query_gpt(lookups: List[Lookup], retry: int = 3) -> List[Translation]:
     for word in lookups:
         lines.append(f"{word.word} :: {word.usage}")
     prompt = "{}\n{}".format(PROMPT, "\n".join(lines))
-    completion = openai.ChatCompletion.create(
-        model=MODEL_ID, 
-        messages=[{"role": "user", "content": prompt},
-    ])
+    try:
+        completion = openai.ChatCompletion.create(
+            model=MODEL_ID, 
+            messages=[{"role": "user", "content": prompt},
+        ])
+    except openai.error.RateLimitError as e:
+        if retry > 0:
+            click.echo("Hit RateLimitError, waiting for retry")
+            time.sleep(5)
+            return query_gpt(lookups, )
+        else:
+            click.echo("Hit RateLimitError, giving up")
+            click.echo(e)
+            raise e
     response = completion.choices[0].message.content
     try:
         translations = json.loads(response)
