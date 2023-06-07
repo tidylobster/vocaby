@@ -4,7 +4,7 @@ import os, time, json, itertools, datetime, textwrap
 from glob import glob
 from typing import List
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from sqlite3 import Connection
 from nltk.stem import PorterStemmer
 from tabulate import tabulate
@@ -19,17 +19,20 @@ BASE_PATH = ".vocaby/"
 PREFIX = "anki"
 MODEL_ID = "gpt-3.5-turbo"
 PROMPT = """
-I need you to translate some words to russian for me. I will send you lines, 
-each containing the word that needs to be translated and a sentence in which 
-it was used. The word and the sentence are separated by ::. Answer in JSON, 
-where you should include the original normalized word (name the field 
-"word"), translation of the word (name the field "translation"), phonetical 
-transcription of the word (name the field "transcription" and do not separate the 
-syllabels), and the sentence (name the field "usage") in which it was used. 
-For the usage field you should highlight the original word in bold using html tag 
-<b>. Only highlight one requested word in the original text (the one on the left 
-of the :: separator). Do not translate the "usage" sentence. Respond with a JSON 
-list, where you should include all of the translations.
+Translate given words to russian.
+The words will be sent in lines, each containing the word that needs to be translated and a sentence in which it was used.
+The word and the sentence are separeted by ::.
+Answer in valid JSON.
+In your response you should include the original word in a normalized form (name the field "word").
+In your response you should include the translation of the original word (name the field "translation").
+In your response you should include the phonetical transcription of the original word (name the field "transcription").
+Do not separate syllables by . in the phonetical transcription.
+In your response you should include the sentence in which the original word was used (name the field "usage").
+Do not translate the usage sentence into russian.
+For the usage field you should highlight the original word in bold using html tag <b>.
+Only highlight the original word in the sentence (the original word is located on the left side of :: symbol of the given input).
+All lines contain separate examples, so do not mix the meanings across different lines.
+Respond with a JSON list, where you should include all of the translations.
 """
 
 
@@ -120,7 +123,7 @@ def translate(limit, no_checkpoint, filename):
             case 0:
                 return
             case 1:
-                timestamp = combined[0]
+                timestamp = combined[0].timestamp
             case _:
                 timestamp = max(map(lambda x: x.timestamp, combined))
         filename = dump(processed.confirmed, PREFIX)
@@ -133,14 +136,17 @@ def translate(limit, no_checkpoint, filename):
             history.save()
             num_unprocessed = get_unprocessed_words_count(conn, timestamp)
             click.echo(f"Words left unprocessed in the database: {num_unprocessed}")
+            print_stats(timestamp, conn)
 
 
 @vocaby.command()
+@click.option("-t", "--timestamp", default=-1, type=int)
 @click.argument("filename", default="vocab.db")
-def stats(filename):
+def stats(timestamp, filename):
     """Show accumulated statistics."""
     with db_resource(filename) as conn:
-        timestamp = load_timestamp()
+        if timestamp == -1:
+            timestamp = load_timestamp()
         print_stats(timestamp, conn)
 
 
@@ -174,6 +180,11 @@ def process_words(words: List[Lookup], history: History) -> Processed:
                     rejected.append(tr)
                 case "r":
                     up_for_retry.append(tr)
+                case "e":
+                    result = click.prompt("What's the best translation?")
+                    new_tr = replace(tr, translation=result)
+                    confirmed.append(new_tr)
+                    history.add(new_tr)
         click.clear()
         if up_for_retry:
             click.echo(f"Retrying requested words: {[tr.word for tr in up_for_retry]}")
@@ -187,6 +198,8 @@ def prompt_user(i: int, limit: int, tr: Translation, history: History):
     click.clear()
     click.echo(f"{i + 1}/{limit}\n")
     click.echo(f"{tr.word} [{tr.transcription}] = {tr.translation}\n")
+    click.echo(textwrap.fill(tr.usage, width=80))
+    click.echo("")
     if tr in history:
         click.echo("#"*80)
         click.echo("Similar word was already processed!\n\n".upper())
@@ -194,15 +207,13 @@ def prompt_user(i: int, limit: int, tr: Translation, history: History):
         wrapped = map(lambda x: textwrap.fill(x, width=80), numbered)
         click.echo("\n---\n".join(wrapped))
         click.echo("#"*80 + "\n")
-    click.echo(textwrap.fill(tr.usage, width=80))
-    click.echo("")
     click.echo(f"{tr.book}")
     click.echo("---\n")
-    text = "Save this translation?\n(y)es, (n)o, (r)etry, (h)istory"
+    text = "Save this translation?\n(y)es, (n)o, (r)etry, (h)istory, (e)dit"
     return click.prompt(
         text=text, 
         default="y", 
-        type=click.Choice(["y", "n", "r", "h"], case_sensitive=False), 
+        type=click.Choice(["y", "n", "r", "h", "e"], case_sensitive=False), 
         show_choices=False
     )
     
@@ -220,16 +231,16 @@ def print_stats(timestamp, conn):
 
 def load_timestamp() -> int:
     """Load latest processed timestamp."""
-    if not os.path.exists(os.path.join(BASE_PATH, "checkoint.json")):
+    if not os.path.exists(os.path.join(BASE_PATH, "checkpoint.json")):
         return 0
-    with open(os.path.join(BASE_PATH, "checkoint.json")) as file:
+    with open(os.path.join(BASE_PATH, "checkpoint.json")) as file:
         return int(json.load(file).get("timestamp", 0))
 
 
 def save_timestamp(timestamp: int):
     """Save latest processed timestamp."""
     os.makedirs(BASE_PATH, exist_ok=True)
-    with open(os.path.join(BASE_PATH, "checkoint.json"), "w") as file:
+    with open(os.path.join(BASE_PATH, "checkpoint.json"), "w") as file:
         json.dump({"timestamp": timestamp}, file)
     
 
@@ -287,7 +298,7 @@ def query_gpt(lookups: List[Lookup], retry: int = 3) -> List[Translation]:
         if retry > 0:
             click.echo("Hit RateLimitError, waiting for retry")
             time.sleep(5)
-            return query_gpt(lookups, )
+            return query_gpt(lookups, retry-1)
         else:
             click.echo("Hit RateLimitError, giving up")
             click.echo(e)
