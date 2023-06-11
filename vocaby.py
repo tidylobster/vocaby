@@ -2,7 +2,7 @@
 import click, sqlite3, openai, openai.error
 import os, time, json, itertools, datetime, textwrap
 from glob import glob
-from typing import List
+from typing import List, Dict
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from sqlite3 import Connection
@@ -25,8 +25,7 @@ The word and the sentence are separeted by ::.
 Answer in valid JSON.
 In your response you should include the original word in a normalized form (name the field "word").
 In your response you should include the translation of the original word (name the field "translation").
-In your response you should include the phonetical transcription of the original word (name the field "transcription").
-Do not separate syllables by . in the phonetical transcription.
+In your response you should include the phonetical transcription without syllables of the original word (name the field "transcription").
 In your response you should include the sentence in which the original word was used (name the field "usage").
 Do not translate the usage sentence into russian.
 For the usage field you should highlight the original word in bold using html tag <b>.
@@ -53,6 +52,9 @@ class Translation:
     book: str
     timestamp: int
 
+    def to_history_record(self):
+        return f"{self.translation} :: {self.usage}"
+
 
 @dataclass
 class Processed:
@@ -61,12 +63,13 @@ class Processed:
 
 
 class History:
-    def __init__(self, words: dict):
+    def __init__(self, words: Dict[str, List[str]]):
         self.words = words
+        self.new_words = []
         self.ps = PorterStemmer()
 
     def __contains__(self, word: Translation):
-        return self.ps.stem(word.word) in self.words
+        return self.words.get(self.ps.stem(word.word))
     
     def __getitem__(self, word: Translation):
         stem = self.ps.stem(word.word)
@@ -74,9 +77,15 @@ class History:
             return self.words[stem]
         else: 
             raise KeyError(stem)
-
+    
     def add(self, word: Translation):
-        self.words.setdefault(self.ps.stem(word.word), []).append(f"{word.translation} :: {word.usage}")
+        self.words.setdefault(self.ps.stem(word.word), []).append(word.to_history_record())
+        self.new_words.append(word)
+
+    def undo_add(self):
+        word = self.new_words[-1]
+        self.new_words = self.new_words[:-1]
+        self.words[self.ps.stem(word.word)].remove(word.to_history_record())
 
     @classmethod
     def load(cls):
@@ -113,8 +122,8 @@ def vocaby():
 def translate(limit, no_checkpoint, filename):
     """Process vocab.db file, translate lookup words and transform them into Anki flashcards."""
     with db_resource(filename) as conn:
-        timestamp = load_timestamp()
         history = History.load()
+        timestamp = load_timestamp()
         print_stats(timestamp, conn)
         lookups = query_db(conn, timestamp, limit)
         processed = process_words(lookups, history)
@@ -167,30 +176,107 @@ def merge(delete):
 
 def process_words(words: List[Lookup], history: History) -> Processed:
     """Process all words using LLM. Retry the prompt if requested."""
-    def inner(words: List[Lookup], confirmed: List[Translation], rejected: List[Translation]):
-        up_for_retry: List[Translation] = []
-        for i, tr in enumerate(query_gpt(words)):
-            match prompt_user(i, len(words), tr, history):
-                case "y": 
-                    confirmed.append(tr)
-                    history.add(tr)
-                case "h":
-                    history.add(tr)
-                case "n":
-                    rejected.append(tr)
-                case "r":
-                    up_for_retry.append(tr)
-                case "e":
-                    result = click.prompt("What's the best translation?")
-                    new_tr = replace(tr, translation=result)
-                    confirmed.append(new_tr)
-                    history.add(new_tr)
+    def inner(words: List[Lookup], actor: UserPropmtActor):
+        translations = query_gpt(words)
+        actor.process(translations)
         click.clear()
-        if up_for_retry:
-            click.echo(f"Retrying requested words: {[tr.word for tr in up_for_retry]}")
-            return inner(up_for_retry, confirmed, rejected)
-        return Processed(confirmed, rejected)
-    return inner(words, [], [])
+        if actor._up_for_retry:
+            click.echo(f"Retrying words: {[tr.word for tr in actor._up_for_retry]}")
+            up_for_retry = actor._up_for_retry
+            actor._up_for_retry = []
+            return inner(up_for_retry, actor)
+        return Processed(actor._confirmed, actor._rejected)
+    
+    actor = UserPropmtActor(history)
+    return inner(words, actor)
+
+
+class UserPropmtActor:
+    def __init__(self, history: History):
+        self._confirmed = []
+        self._rejected = []
+        self._up_for_retry = []
+        self._actions = []
+        self.history = history
+
+    def process(self, words: List[Translation], idx: int = 0):
+        length = len(words)
+        while idx < length:
+            word = words[idx]
+            action = prompt_user(idx, length, word, self.history)
+            self._actions.append(action)
+            match action:
+                case "y":
+                    self.add_for_learning(word)
+                    idx += 1
+                case "h":
+                    self.add_for_history(word)
+                    idx += 1
+                case "n":
+                    self.reject(word)
+                    idx += 1
+                case "r":
+                    self.add_for_retry(word)
+                    idx += 1
+                case "e":
+                    self.edit_translation(word)
+                    idx += 1
+                case "u":
+                    self.undo()
+                    idx -= 1
+
+    def undo(self):
+        match self._actions[-1]:
+            case "y":
+                self.undo_add_for_learning()
+            case "h":
+                self.undo_add_for_history()
+            case "n":
+                self.undo_reject()
+            case "r":
+                self.undo_add_for_retry()
+            case "e":
+                self.undo_edit_translation()
+        self._actions = self._actions[:-1]
+
+    def add_for_learning(self, word: Translation):
+        self._confirmed.append(word)
+        self.history.add(word)
+
+    def undo_add_for_learning(self):
+        self._confirmed = self._confirmed[:-1]
+        self.history.undo_add()
+        self._actions = self._actions[:-1]
+
+    def add_for_history(self, word: Translation):
+        self.history.add(word)
+
+    def undo_add_for_history(self):
+        self.history.undo_add()
+        self._actions = self._actions[:-1]
+
+    def add_for_retry(self, word: Translation):
+        self._up_for_retry.append(word)
+    
+    def undo_add_for_retry(self):
+        self._up_for_retry = self._up_for_retry[:-1]
+        self._actions = self._actions[:-1]
+
+    def reject(self, word: Translation):
+        self._rejected.append(word)
+    
+    def undo_reject(self):
+        self._rejected = self._rejected[:-1]
+        self._actions = self._actions[:-1]
+
+    def edit_translation(self, word: Translation):
+        result = click.prompt("What's the best translation?")
+        new_word = replace(word, translation=result)
+        self.add_for_learning(new_word)
+
+    def undo_edit_translation(self):
+        self.undo_add_for_learning()
+        self._actions = self._actions[:-1]
 
 
 def prompt_user(i: int, limit: int, tr: Translation, history: History):
@@ -209,11 +295,11 @@ def prompt_user(i: int, limit: int, tr: Translation, history: History):
         click.echo("#"*80 + "\n")
     click.echo(f"{tr.book}")
     click.echo("---\n")
-    text = "Save this translation?\n(y)es, (n)o, (r)etry, (h)istory, (e)dit"
+    text = "Save this translation?\n(y)es, (n)o, (r)etry, (h)istory, (e)dit, (u)ndo"
     return click.prompt(
         text=text, 
         default="y", 
-        type=click.Choice(["y", "n", "r", "h", "e"], case_sensitive=False), 
+        type=click.Choice(["y", "n", "r", "h", "e", "u"], case_sensitive=False), 
         show_choices=False
     )
     
