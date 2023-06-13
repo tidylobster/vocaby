@@ -25,8 +25,8 @@ The word and the sentence are separeted by ::.
 Answer in valid JSON.
 In your response you should include the original word in a normalized form (name the field "word").
 In your response you should include the translation of the original word (name the field "translation").
-In your response you should include the phonetical transcription without syllables of the original word (name the field "transcription").
-In your response you should include the sentence in which the original word was used (name the field "usage").
+In your response you should include the phonetical transcription **without** syllables of the original word (name the field "transcription").
+In your response you should include the original sentence in which the word was used (name the field "usage").
 Do not translate the usage sentence into russian.
 For the usage field you should highlight the original word in bold using html tag <b>.
 Only highlight the original word in the sentence (the original word is located on the left side of :: symbol of the given input).
@@ -143,8 +143,6 @@ def translate(limit, no_checkpoint, filename):
             click.echo("Updated checkpoints")
             save_timestamp(timestamp)
             history.save()
-            num_unprocessed = get_unprocessed_words_count(conn, timestamp)
-            click.echo(f"Words left unprocessed in the database: {num_unprocessed}")
             print_stats(timestamp, conn)
 
 
@@ -180,18 +178,19 @@ def process_words(words: List[Lookup], history: History) -> Processed:
         translations = query_gpt(words)
         actor.process(translations)
         click.clear()
-        if actor._up_for_retry:
-            click.echo(f"Retrying words: {[tr.word for tr in actor._up_for_retry]}")
-            up_for_retry = actor._up_for_retry
-            actor._up_for_retry = []
-            return inner(up_for_retry, actor)
-        return Processed(actor._confirmed, actor._rejected)
+        if up_for_retries := actor.pop_retries():
+            click.echo(f"Retrying words: {[tr.word for tr in up_for_retries]}")
+            return inner(up_for_retries, actor)
+        return actor.to_processed()
     
     actor = UserPropmtActor(history)
     return inner(words, actor)
 
 
 class UserPropmtActor:
+    """
+    Interact with a User regarding translation's quality.
+    """
     def __init__(self, history: History):
         self._confirmed = []
         self._rejected = []
@@ -203,7 +202,7 @@ class UserPropmtActor:
         length = len(words)
         while idx < length:
             word = words[idx]
-            action = prompt_user(idx, length, word, self.history)
+            action = self.prompt_user(idx, length, word)
             self._actions.append(action)
             match action:
                 case "y":
@@ -224,6 +223,30 @@ class UserPropmtActor:
                 case "u":
                     self.undo()
                     idx -= 1
+    
+    def prompt_user(self, idx: int, length: int, word: Translation):
+        """Ask user if the translation is good enough. Either save the translation, reject it or retry with LLM."""
+        click.clear()
+        click.echo(f"{idx + 1}/{length}\n")
+        click.echo(f"{word.word} [{word.transcription}] = {word.translation}\n")
+        click.echo(textwrap.fill(word.usage, width=80))
+        click.echo("")
+        if word in self.history:
+            click.echo("#"*80)
+            click.echo("Similar word was already processed!\n\n".upper())
+            numbered = map(lambda i: f'{i[0]+1}. {i[1]}', enumerate(self.history[word]))
+            wrapped = map(lambda x: textwrap.fill(x, width=80), numbered)
+            click.echo("\n---\n".join(wrapped))
+            click.echo("#"*80 + "\n")
+        click.echo(f"{word.book}")
+        click.echo("---\n")
+        text = "Save this translation?\n(y)es, (n)o, (r)etry, (h)istory, (e)dit, (u)ndo"
+        return click.prompt(
+            text=text, 
+            default="y", 
+            type=click.Choice(["y", "n", "r", "h", "e", "u"], case_sensitive=False), 
+            show_choices=False
+        )
 
     def undo(self):
         match self._actions[-1]:
@@ -277,32 +300,15 @@ class UserPropmtActor:
     def undo_edit_translation(self):
         self.undo_add_for_learning()
         self._actions = self._actions[:-1]
-
-
-def prompt_user(i: int, limit: int, tr: Translation, history: History):
-    """Ask user if the translation is good enough. Either save the translation, reject it or retry with LLM."""
-    click.clear()
-    click.echo(f"{i + 1}/{limit}\n")
-    click.echo(f"{tr.word} [{tr.transcription}] = {tr.translation}\n")
-    click.echo(textwrap.fill(tr.usage, width=80))
-    click.echo("")
-    if tr in history:
-        click.echo("#"*80)
-        click.echo("Similar word was already processed!\n\n".upper())
-        numbered = map(lambda i: f'{i[0]+1}. {i[1]}', enumerate(history[tr]))
-        wrapped = map(lambda x: textwrap.fill(x, width=80), numbered)
-        click.echo("\n---\n".join(wrapped))
-        click.echo("#"*80 + "\n")
-    click.echo(f"{tr.book}")
-    click.echo("---\n")
-    text = "Save this translation?\n(y)es, (n)o, (r)etry, (h)istory, (e)dit, (u)ndo"
-    return click.prompt(
-        text=text, 
-        default="y", 
-        type=click.Choice(["y", "n", "r", "h", "e", "u"], case_sensitive=False), 
-        show_choices=False
-    )
     
+    def pop_retries(self):
+        up_for_retry = self._up_for_retry
+        self._up_for_retry = []
+        return up_for_retry
+    
+    def to_processed(self):
+        return Processed(self._confirmed, self._rejected)
+
 
 def print_stats(timestamp, conn):
     """Print accumulated statistics for user."""
