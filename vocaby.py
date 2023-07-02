@@ -1,8 +1,8 @@
-
 import click, sqlite3, openai, openai.error
 import os, time, json, itertools, datetime, textwrap
 from glob import glob
-from typing import List, Dict
+from functools import cached_property
+from typing import List, Dict, Optional
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from sqlite3 import Connection
@@ -60,12 +60,17 @@ class Translation:
 class Processed:
     confirmed: List[Translation]
     rejected: List[Translation]
+    max_timestamp: int
+
+    @cached_property
+    def combined(self):
+        return list(itertools.chain(self.confirmed, self.rejected))
 
 
 class History:
     def __init__(self, words: Dict[str, List[str]]):
         self.words = words
-        self.new_words = []
+        self.new_words: List[Translation] = []
         self.ps = PorterStemmer()
 
     def __contains__(self, word: Translation):
@@ -125,25 +130,16 @@ def translate(limit, no_checkpoint, filename):
         history = History.load()
         timestamp = load_timestamp()
         print_stats(timestamp, conn)
-        lookups = query_db(conn, timestamp, limit)
-        processed = process_words(lookups, history)
-        combined = list(itertools.chain(processed.confirmed, processed.rejected))
-        match len(combined):
-            case 0:
-                return
-            case 1:
-                timestamp = combined[0].timestamp
-            case _:
-                timestamp = max(map(lambda x: x.timestamp, combined))
+        processed = process_words(query_db(conn, timestamp, limit), history)
         filename = dump(processed.confirmed, PREFIX)
         click.echo(f"Saved new words to {filename}")
         if no_checkpoint:
             click.echo("Skipped updating checkpoints")
         else:
             click.echo("Updated checkpoints")
-            save_timestamp(timestamp)
+            save_timestamp(processed.max_timestamp)
             history.save()
-            print_stats(timestamp, conn)
+            print_stats(processed.max_timestamp, conn)
 
 
 @vocaby.command()
@@ -161,6 +157,9 @@ def stats(timestamp, filename):
 @click.option("--delete", is_flag=True, default=False)
 def merge(delete):
     """Merge Anki flashcards into a single batch."""
+    if os.path.exists(f"{PREFIX}.txt"):
+        if not click.confirm(f"{PREFIX}.txt already exists, would you like to proceed?", default=False):
+            return click.echo("Aborted")
     lines = []
     for filename in glob(f"{PREFIX}_*.txt"):
         with open(filename, "r") as file:
@@ -176,15 +175,28 @@ def process_words(words: List[Lookup], history: History) -> Processed:
     """Process all words using LLM. Retry the prompt if requested."""
     def inner(words: List[Lookup], actor: UserPropmtActor):
         translations = query_gpt(words)
-        actor.process(translations)
+        max_timestamp = get_max_timestamp(translations)
+        filtered = filter_words(translations, history)
+        actor.process(filtered)
         click.clear()
         if up_for_retries := actor.pop_retries():
             click.echo(f"Retrying words: {[tr.word for tr in up_for_retries]}")
             return inner(up_for_retries, actor)
-        return actor.to_processed()
+        return Processed(actor._confirmed, actor._rejected, max_timestamp)
     
     actor = UserPropmtActor(history)
     return inner(words, actor)
+
+
+def filter_words(words: List[Translation], history: History) -> List[Translation]:
+    result = []
+    for word in words:
+        if word in history and any([h.startswith(word.translation) for h in history[word]]):
+            continue
+        result.append(word)
+    click.echo(f"Filtered {len(words) - len(result)} words, as already translated")
+    return result
+
 
 
 class UserPropmtActor:
@@ -203,21 +215,25 @@ class UserPropmtActor:
         while idx < length:
             word = words[idx]
             action = self.prompt_user(idx, length, word)
-            self._actions.append(action)
             match action:
                 case "y":
+                    self._actions.append(action)
                     self.add_for_learning(word)
                     idx += 1
                 case "h":
+                    self._actions.append(action)
                     self.add_for_history(word)
                     idx += 1
                 case "n":
+                    self._actions.append(action)
                     self.reject(word)
                     idx += 1
                 case "r":
+                    self._actions.append(action)
                     self.add_for_retry(word)
                     idx += 1
                 case "e":
+                    self._actions.append(action)
                     self.edit_translation(word)
                     idx += 1
                 case "u":
@@ -306,9 +322,6 @@ class UserPropmtActor:
         self._up_for_retry = []
         return up_for_retry
     
-    def to_processed(self):
-        return Processed(self._confirmed, self._rejected)
-
 
 def print_stats(timestamp, conn):
     """Print accumulated statistics for user."""
@@ -334,6 +347,11 @@ def save_timestamp(timestamp: int):
     os.makedirs(BASE_PATH, exist_ok=True)
     with open(os.path.join(BASE_PATH, "checkpoint.json"), "w") as file:
         json.dump({"timestamp": timestamp}, file)
+
+
+def get_max_timestamp(words: List[Translation]) -> Optional[int]:
+    if len(words):
+        return max(map(lambda x: x.timestamp, words))
     
 
 def get_unprocessed_words_count(conn: Connection, timestamp: int):
@@ -411,7 +429,7 @@ def query_gpt(lookups: List[Lookup], retry: int = 3) -> List[Translation]:
         result.append(Translation(
             tr["word"].lower(), 
             tr["translation"].lower(), 
-            tr["transcription"], 
+            tr["transcription"].replace(".", ""),
             tr["usage"], 
             word.book, 
             word.timestamp
@@ -425,7 +443,6 @@ def dump(words: List[Translation], prefix = ""):
     filename = f"{prefix}_{ts.isoformat()}.txt"
     with open(filename, "w") as file:
         for word in words:
-            word.usage
             file.write(f"{word.word} [{word.transcription}] <br><br>{word.usage}<br><br>{word.book}|{word.translation}\n")
     return filename
 
